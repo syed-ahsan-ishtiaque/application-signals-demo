@@ -11,58 +11,48 @@ import boto3
 import datetime
 import os
 import json
-import random
 import time
 
 logger = logging.getLogger(__name__)
-# Create your views here.
+
+_INVALID_NAMES_CACHE = None
+_INVALID_NAMES_CACHE_TIME = None
+_CACHE_TTL = 300
 
 class BillingViewSet(viewsets.ViewSet):
     def list(self, request):
+        global _INVALID_NAMES_CACHE, _INVALID_NAMES_CACHE_TIME
+        
         logger.info("BillingViewSet.list() called - Fetching billing records")
         span = trace.get_current_span()
 
-        # Read all three limits from environment (or use defaults)
-        small_limit = int(os.getenv("SMALL_NAME_LIMIT", 100))      # default 100
-        medium_limit = int(os.getenv("MEDIUM_NAME_LIMIT", 1_000))   # default 1k
-        large_limit = int(os.getenv("LARGE_NAME_LIMIT", 1_000_000))  # default 1M
-
-        # Pick with 1% → large, 10% → medium, otherwise → small
-        r = random.random()
-        if r < 0.01:
-            subquery_limit = large_limit
-            logger.debug(f"Selected large subquery limit: {subquery_limit}")
-        elif r < 0.11:
-            subquery_limit = medium_limit
-            logger.debug(f"Selected medium subquery limit: {subquery_limit}")
-        else:
-            subquery_limit = small_limit
-            logger.debug(f"Selected small subquery limit: {subquery_limit}")
-
-        invalid_names = CheckList.objects.values('invalid_name').distinct()[:subquery_limit]
-
-        MAX_RESULTS_BOUND = int(os.getenv("MAX_BILLING_RESULTS", 10_000))
-        max_results = random.randint(int(MAX_RESULTS_BOUND/10), MAX_RESULTS_BOUND)
-        logger.info(f"Query parameters - subquery_limit: {subquery_limit}, max_results: {max_results}")
+        FIXED_SUBQUERY_LIMIT = int(os.getenv("SUBQUERY_LIMIT", 100))
         
-        qs = Billing.objects.exclude(
-            type_name__in=Subquery(invalid_names)
-        )[:max_results]
+        current_time = time.time()
+        if (_INVALID_NAMES_CACHE is None or 
+            _INVALID_NAMES_CACHE_TIME is None or 
+            (current_time - _INVALID_NAMES_CACHE_TIME) > _CACHE_TTL):
+            _INVALID_NAMES_CACHE = list(
+                CheckList.objects.values_list('invalid_name', flat=True).distinct()[:FIXED_SUBQUERY_LIMIT]
+            )
+            _INVALID_NAMES_CACHE_TIME = current_time
+            logger.debug(f"Refreshed invalid_names cache with {len(_INVALID_NAMES_CACHE)} entries")
 
+        MAX_RESULTS = int(os.getenv("MAX_BILLING_RESULTS", 1000))
+        logger.info(f"Query parameters - subquery_limit: {FIXED_SUBQUERY_LIMIT}, max_results: {MAX_RESULTS}")
+        
+        qs = Billing.objects.exclude(type_name__in=_INVALID_NAMES_CACHE)[:MAX_RESULTS]
 
-        # force the DB query and count rows
         db_start = time.time()
-        # list(qs) actually hit the database
         objs = list(qs)  
         db_duration_ms = (time.time() - db_start) * 1_000
         record_count = len(objs)
         logger.info(f"Database query completed - Records: {record_count}, Duration: {db_duration_ms:.2f}ms")
         
-        span.set_attribute("db.subquery_limit", subquery_limit)
+        span.set_attribute("db.subquery_limit", FIXED_SUBQUERY_LIMIT)
         span.set_attribute("db.record_count", record_count)
         span.set_attribute("db.fetch_time_ms", db_duration_ms)
 
-        # measure serialization
         ser_start = time.time()
         serializer = BillingSerializer(objs, many=True)
         ser_duration_ms = (time.time() - ser_start) * 1_000
@@ -126,26 +116,21 @@ class BillingViewSet(viewsets.ViewSet):
     def log(self, data):
         logger.info(f"BillingViewSet.log() called - Logging billing data to DynamoDB")
         try:
-            # Initialize a DynamoDB client
             region = os.environ.get('REGION', 'us-east-1')
             client = boto3.client('dynamodb', region_name=region)
             logger.debug(f"DynamoDB client initialized for region: {region}")
 
-            # Define the table name
             table_name = 'BillingInfo'
             current_time = datetime.datetime.now()
             formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Define the item you want to add
             item = {
                 'ownerId': {'S': data['owner_id']},
                 'timestamp': {'S': formatted_time},
                 'billing': {'S': json.dumps(data)},
-                # Add more attributes as needed
             }
 
             logger.debug(f"Preparing to write to DynamoDB table: {table_name}")
-            # Add the item to the table
             response = client.put_item(
                 TableName=table_name,
                 Item=item
@@ -153,29 +138,23 @@ class BillingViewSet(viewsets.ViewSet):
             logger.info(f"BillingViewSet.log() - Successfully logged billing data to DynamoDB, owner_id: {data.get('owner_id')}")
         except Exception as e:
             logger.error(f"BillingViewSet.log() - Failed to log billing data to DynamoDB: {str(e)}")
-            # Don't raise the exception to avoid disrupting the main flow
 
 
 class SummaryViewSet(viewsets.ViewSet):
     def list(self, request, pk=None):
         span = trace.get_current_span()
         
-        # Always set request counter to 1
         span.set_attribute("billing_summary_request", 1)
 
-         # Set num_summaries based on current minute
         current_minute = timezone.now().minute
         num_summaries = 50 if current_minute % 5 == 0 else 2
         
-        # Use random cache key to simulate high cache miss rate
-        cache_key = f'billing_summary_last_7_days_{random.randint(1, num_summaries)}'
+        cache_key = f'billing_summary_last_7_days_{current_minute % num_summaries}'
         summary = cache.get(cache_key)
         
         if summary is None:
-            # Cache miss
             span.set_attribute("billing_summary_cache_hit", 0)
             
-            # Sleep to simulate high latency when there's a cache miss 
             time.sleep(2)
             
             billings = Billing.objects.all()
@@ -186,9 +165,8 @@ class SummaryViewSet(viewsets.ViewSet):
                 'period': 'all_time'
             }
             
-            cache.set(cache_key, summary, 300)  # Cache for 5 minutes
+            cache.set(cache_key, summary, 300)
         else:
-            # Cache hit
             span.set_attribute("billing_summary_cache_hit", 1)
         
         return Response(summary)
